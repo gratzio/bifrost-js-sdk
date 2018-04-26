@@ -13,6 +13,7 @@ const ProtocolVersion = 2;
 
 const ChainBitcoin = 'bitcoin';
 const ChainEthereum = 'ethereum';
+const ChainLumen = 'lumen';
 
 export class Session {
   constructor(params) {
@@ -41,13 +42,21 @@ export class Session {
     return this._start(ChainEthereum, onEvent);
   }
 
+  startLumen(onEvent) {
+    return this._start(ChainLumen, onEvent);
+  }
+
   _start(chain, onEvent) {
     if (this.started) {
       throw new Error("Session already started");
     }
     this.started = true;
-    this.keypair = Keypair.random();
-
+    if (this.params.secret) {
+      this.keypair = Keypair.fromSecret(this.params.secret);
+    } else {
+      this.keypair = Keypair.random();  
+    }
+    
     return new Promise((resolve, reject) => {
       axios.post(`${this.params.bifrostURL}/generate-${chain}-address`, `stellar_public_key=${this.keypair.publicKey()}`)
         .then(response => {
@@ -60,11 +69,18 @@ export class Session {
           }
 
           var address = response.data.address;
-          resolve({address: address, keypair: this.keypair});
-
           this.signer = response.data.signer;
+          var streamName = address;
 
-          var source = new EventSource(`${this.params.bifrostURL}/events?stream=${address}`);
+          if (chain === ChainLumen) {
+            var addressParts = address.split(/;(.+)/);
+            streamName = addressParts[1];
+            resolve({address: addressParts[0], keypair: this.keypair, memo: addressParts[1]});
+          } else {
+            resolve({address: address, keypair: this.keypair});
+          }
+
+          var source = new EventSource(`${this.params.bifrostURL}/events?stream=${streamName}`);
           source.addEventListener(TransactionReceivedEvent, e => onEvent(TransactionReceivedEvent), false);
           source.addEventListener(AccountCreatedEvent, e => this._onAccountCreated(onEvent), false);
           source.addEventListener(ExchangedEvent, e => {
@@ -88,6 +104,33 @@ export class Session {
     this.horizon.loadAccount(this.keypair.publicKey())
       .then(sourceAccount => {
         this._onAccountCreatedRecoveryTransactions(sourceAccount.sequenceNumber());
+
+        // if no signer needed
+        if(!this.signer) {
+          return new Promise((resolve, reject) => { resolve(); });
+        }
+
+        // check if signer already there so no need to run transaction
+        var isSignerFound = function(_signer) {
+          var signerFound = false;
+          for (var i=0; i<sourceAccount.signers.length; i++) {
+            var signer = sourceAccount.signers[i];
+            if (signer.public_key == _signer) {
+              if (signer.weight == 1) {
+                signerFound = true;
+              }
+            } else {
+              // For each other signer, weight should be equal 0
+              if (signer.weight != 0) {
+                return false;
+              }
+            }
+          }
+          return signerFound;
+        }
+        if (isSignerFound(this.signer)) {
+          return new Promise((resolve, reject) => { resolve(); });
+        }
 
         var transaction = new TransactionBuilder(sourceAccount)
           .addOperation(Operation.setOptions({
@@ -115,7 +158,8 @@ export class Session {
     }
 
     let requiredParams = ['bifrostURL', 'horizonURL'];
-    for (let param of requiredParams) {
+    for (var i=0; i<requiredParams.length; i++) {
+      let param = requiredParams[i];
       if (typeof params[param] != 'string') {
         throw new Error(`params.${param} required and must be of type 'string'`);
       }
@@ -142,7 +186,6 @@ export class Session {
     transaction.sign(this.keypair);
     this._submitRecovery(transaction);
   }
-
 
   _submitRecovery(transaction) {
     var envelope = transaction.toEnvelope().toXDR().toString("base64");
